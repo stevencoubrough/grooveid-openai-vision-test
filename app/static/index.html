@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GrooveID Identify</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 600px;
+      margin: 40px auto;
+      padding: 20px;
+    }
+    label {
+      display: block;
+      margin-top: 12px;
+    }
+    .result {
+      margin-top: 20px;
+      white-space: pre-wrap;
+      background: #f4f4f4;
+      padding: 10px;
+      border: 1px solid #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h1>GrooveID Identify</h1>
+  <p>Upload a record label image or provide a URL and get back structured metadata and Discogs matches.</p>
+  <form id="identifyForm">
+    <label for="image_url">Image URL:</label>
+    <input type="url" id="image_url" name="image_url" style="width: 100%;" />
+    <p style="margin: 8px 0;">OR</p>
+    <label for="image_file">Upload Image:</label>
+    <input type="file" id="image_file" name="image_file" accept="image/*" />
+    <button type="submit" style="margin-top: 12px;">Identify</button>
+  </form>
+  <div class="result" id="result"></div>
+  <script>
+    const form = document.getElementById('identifyForm');
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const resultDiv = document.getElementById('result');
+      resultDiv.textContent = 'Processing...';
+      const formData = new FormData(form);
+      try {
+        const res = await fetch('/identify', { method: 'POST', body: formData });
+        if (!res.ok) {
+          const err = await res.text();
+          resultDiv.textContent = 'Error: ' + err;
+          return;
+        }
+        const data = await res.json();
+        resultDiv.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        resultDiv.textContent = 'Error: ' + err;
+      }
+    });
+  </script>
+</body>
+</html>
