@@ -43,6 +43,13 @@
       const resultDiv = document.getElementById('result');
       resultDiv.textContent = 'Processing...';
       const formData = new FormData(form);
+
+      // 🔑 Fix: don’t send image_url if it’s blank
+      const urlValue = formData.get('image_url');
+      if (!urlValue) {
+        formData.delete('image_url');
+      }
+
       try {
         const res = await fetch('/identify', { method: 'POST', body: formData });
         if (!res.ok) {
