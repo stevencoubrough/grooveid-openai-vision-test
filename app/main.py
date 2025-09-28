@@ -10,7 +10,10 @@ from dotenv import load_dotenv
 
 from .models.schemas import IdentifyResponse, VisionExtract, DiscogsResult
 from .services.vision_openai import extract_from_image
+#  urllib.parse import urlparse
 from .services.discogs_client import search_candidates, rank_candidates
+from urllib.parse import urlparse
+
 
 load_dotenv()
 
@@ -37,11 +40,20 @@ async def identify(
     image_file: Optional[UploadFile] = File(None),
 ) -> IdentifyResponse:
     """
-    Identify a record by image URL or uploaded file. Returns structured data and ranked Discogs results.
+    
+        # Normalize and validate the URL; strip and check scheme/netloc
+    raw_url = (image_url or "").strip()
+    url = None
+    if raw_url:
+        parsed = urlparse(raw_url)
+        if parsed.scheme and parsed.netloc:
+            url = raw_url
+    # End URL normalization
+Identify a record by image URL or uploaded file. Returns structured data and ranked Discogs results.
     """
 
     # Normalize the URL: treat blank or whitespace strings as None
-    url = (image_url or "").strip() if image_url else None
+  #  url = (image_url or "").strip() if image_url else None
 
     if not url and not image_file:
         raise HTTPException(400, "Provide either image_url or image_file")
