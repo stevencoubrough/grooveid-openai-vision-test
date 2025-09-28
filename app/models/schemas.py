@@ -1,31 +1,22 @@
-from pydantic import BaseModel, HttpUrl, Field
-from typing import List, Optional
+# app/models/schemas.py
 
-class VisionExtract(BaseModel):
-    artist: Optional[str] = None
-    title: Optional[str] = None
-    label: Optional[str] = None
-    catalog_no: Optional[str] = Field(None, alias="catalogNo")
-    year: Optional[str] = None
-    country: Optional[str] = None
-    confidence_notes: Optional[str] = None
-    raw_text: Optional[str] = None
-    keywords: List[str] = []
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
 
 class DiscogsResult(BaseModel):
-    id: int
-    type: str
-    title: str
+    id: Optional[int] = None
+    type: Optional[str] = None
+    title: Optional[str] = None
     year: Optional[int] = None
     country: Optional[str] = None
     label: Optional[List[str]] = None
     catno: Optional[str] = None
-    resource_url: Optional[HttpUrl] = None
-    uri: Optional[str] = None  # web URI path e.g. /release/1234
+    resource_url: Optional[str] = None
+    uri: Optional[str] = None
 
 class IdentifyResponse(BaseModel):
-    source_image: Optional[HttpUrl] = None
-    vision: VisionExtract
+    source_image: Optional[str] = None
+    vision: Dict[str, Any]
     best_guess: Optional[DiscogsResult] = None
     candidates: List[DiscogsResult] = []
     notes: Optional[str] = None
