@@ -6,13 +6,9 @@ import json
 
 from openai import OpenAI
 
-# Read model from env (falls back to gpt-4o)
 MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
-
-# Single OpenAI client (sync API)
 _client = OpenAI()
 
-# System prompt that forces strict JSON for our schema
 VISION_SYSTEM_PROMPT = """
 You extract record metadata from label images and return strict JSON only
 matching this schema:
@@ -35,50 +31,34 @@ Rules:
 - Output MUST be valid JSON without code fences.
 """
 
-
 def _to_data_uri(image_b64: str) -> str:
     return f"data:image/jpeg;base64,{image_b64}"
-
 
 async def extract_from_image(
     image_url: Optional[str] = None,
     image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Extract structured record metadata (artist, title, label, catalogNo, year, etc.)
-    from an image via the OpenAI Chat Completions API.
-
-    Accepts either a public image URL or a base64-encoded JPEG (without the header).
-    Returns a Python dict with the keys defined in VISION_SYSTEM_PROMPT.
+    Extract structured record metadata from an image via Chat Completions.
+    Accepts either a public image URL or a base64-encoded JPEG (no header).
+    Returns a Python dict per the schema in VISION_SYSTEM_PROMPT.
     """
     if not image_url and not image_b64:
         raise ValueError("extract_from_image: provide image_url or image_b64")
 
-    # Build the image part for the multimodal message
     if image_b64:
-        image_part = {
-            "type": "image_url",
-            "image_url": {"url": _to_data_uri(image_b64)},
-        }
+        image_part = {"type": "image_url", "image_url": {"url": _to_data_uri(image_b64)}}
     else:
-        image_part = {
-            "type": "image_url",
-            "image_url": {"url": image_url},
-        }
+        image_part = {"type": "image_url", "image_url": {"url": image_url}}
 
-    # Compose the messages
     messages = [
         {"role": "system", "content": VISION_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Extract metadata as per schema."},
-                image_part,
-            ],
-        },
+        {"role": "user", "content": [
+            {"type": "text", "text": "Extract metadata as per schema."},
+            image_part
+        ]}
     ]
 
-    # Call Chat Completions (sync SDK; fast enough for our use case)
     resp = _client.chat.completions.create(
         model=MODEL,
         messages=messages,
@@ -87,19 +67,13 @@ async def extract_from_image(
         max_tokens=600,
     )
 
-    # Parse JSON response safely
-    text = resp.choices[0].message.content or ""
-    text = text.strip()
-
+    text = (resp.choices[0].message.content or "").strip()
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Defensive: strip code-fences if provider wraps it
-        cleaned = text.strip("` \n")
-        cleaned = cleaned.replace("json\n", "").replace("json\r", "")
+        cleaned = text.strip("` \n").replace("json\n", "").replace("json\r", "")
         data = json.loads(cleaned)
 
-    # Ensure all keys exist (defensive downstream)
     for k in ("artist", "title", "label", "catalogNo", "year", "country", "keywords", "raw_text"):
         data.setdefault(k, None if k != "keywords" else [])
 
