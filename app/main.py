@@ -5,7 +5,7 @@ from typing import Optional, List, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import HttpUrl
+# from pydantic import HttpUrl  # no longer needed
 from dotenv import load_dotenv
 
 from .models.schemas import IdentifyResponse, VisionExtract, DiscogsResult
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 ENABLE_DEBUG = os.getenv("ENABLE_DEBUG", "false").lower() == "true"
 LOG_SCORE_BREAKDOWN = os.getenv("LOG_SCORE_BREAKDOWN", "false").lower() == "true"
 
+
 def _b64(file_bytes: bytes) -> str:
     return base64.b64encode(file_bytes).decode("utf-8")
 
@@ -32,33 +33,42 @@ last_vision_raw: Optional[dict] = None
 
 @app.post("/identify", response_model=IdentifyResponse)
 async def identify(
-    image_url: Optional[HttpUrl] = Form(None),
-    image_file: Optional[UploadFile] = File(None)
+    image_url: Optional[str] = Form(None),
+    image_file: Optional[UploadFile] = File(None),
 ) -> IdentifyResponse:
     """
     Identify a record by image URL or uploaded file. Returns structured data and ranked Discogs results.
     """
-    global last_vision_raw
-    if not image_url and not image_file:
+
+    # Normalize the URL: treat blank or whitespace strings as None
+    url = (image_url or "").strip() if image_url else None
+
+    if not url and not image_file:
         raise HTTPException(400, "Provide either image_url or image_file")
 
     b64 = None
     src_url = None
 
-    if image_url:
-        src_url = str(image_url)
+    if url:
+        src_url = url
     else:
         # read the upload and convert to base64
         content = await image_file.read()
-        if len(content) == 0:
+        if not content:
             raise HTTPException(400, "Empty file")
         b64 = _b64(content)
 
     # 1) Vision extraction
-    vision = await extract_from_image(image_url=src_url, image_b64=b64)
+    try:
+        vision = await extract_from_image(image_url=src_url, image_b64=b64)
+    except Exception as e:
+        logger.error("Vision extraction failed", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Vision provider error: {e}")
+
     v = vision.data
 
     # store raw for debug
+    global last_vision_raw
     last_vision_raw = v
 
     # 2) Discogs candidates
@@ -68,23 +78,20 @@ async def identify(
     catno = v.get("catalogNo")
     year = v.get("year")
     country = v.get("country")
-    keywords = v.get("keywords", []) or []
+    keywords = v.get("keywords") or []
 
     candidates = await search_candidates(artist, title, label, catno, keywords)
-    ranked = rank_candidates(candidates, artist, title, label, catno, year, country, return_scores=LOG_SCORE_BREAKDOWN)
+    ranked = rank_candidates(candidates, artist, title, label, catno, year, country)
 
     # Build response models
     c_models: List[DiscogsResult] = []
-    best: Optional[DiscogsResult] = None
-
-    for rank in ranked:
-        # rank may be (score, item) if LOG_SCORE_BREAKDOWN else item
-        if isinstance(rank, tuple):
-            score, it = rank  # type: ignore
+    for item in ranked:
+        if isinstance(item, Tuple):
+            score, it = item
             if LOG_SCORE_BREAKDOWN:
                 logger.info("Candidate ID %s scored %s", it.get("id"), score)
         else:
-            it = rank
+            it = item
 
         model = DiscogsResult(
             id=it.get("id"),
@@ -95,12 +102,11 @@ async def identify(
             label=it.get("label"),
             catno=it.get("catno"),
             resource_url=it.get("resource_url"),
-            uri=it.get("uri")
+            uri=it.get("uri"),
         )
         c_models.append(model)
 
-    if c_models:
-        best = c_models[0]
+    best = c_models[0] if c_models else None
 
     # 3) Final JSON
     return IdentifyResponse(
@@ -108,24 +114,11 @@ async def identify(
         vision=VisionExtract(**v),
         best_guess=best,
         candidates=c_models,
-        notes="Heuristic ranking: catno/label > artist/title > year > country"
+        notes="Heuristic ranking: catno/label > artist/title > year > country",
     )
 
 @app.get("/debug/echo")
-async def debug_echo() -> JSONResponse:
-    """
-    Return the last raw vision extraction JSON. Enabled only when ENABLE_DEBUG=true.
-    """
+async def debug_echo():
     if not ENABLE_DEBUG:
-        raise HTTPException(404, "Debug endpoint disabled.")
-    if last_vision_raw is None:
-        return JSONResponse(content={"error": "No vision extraction performed yet."})
-    return JSONResponse(content=last_vision_raw)
-
-@app.get("/", response_class=FileResponse)
-async def index() -> FileResponse:
-    """
-    Serve a simple front-end page for testing the API.
-    """
-    static_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
-    return FileResponse(static_path, media_type="text/html")
+        raise HTTPException(status_code=404, detail="Debug disabled")
+    return JSONResponse(last_vision_raw or {"message": "No vision data yet"})
