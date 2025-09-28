@@ -1,8 +1,9 @@
 # app/main.py
 
-from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from dotenv import load_dotenv
 
 # Pydantic response models
@@ -16,8 +17,8 @@ load_dotenv()
 
 app = FastAPI(title="GrooveID Identify API", version="0.2.0")
 
-# Last raw vision payload for debug
-last_vision_raw: Optional[dict] = None
+# Keep last raw vision result for debugging
+last_vision_raw: Optional[Dict[str, Any]] = None
 
 
 @app.post("/identify", response_model=IdentifyResponse)
@@ -30,7 +31,7 @@ async def identify(
     """
     global last_vision_raw
 
-    # Normalize and validate the image_url; treat blank or invalid as None
+    # Normalize and validate the URL; treat blank or invalid as None
     raw_url = (image_url or "").strip()
     url = None
     if raw_url:
@@ -42,9 +43,9 @@ async def identify(
     if not url and not image_file:
         raise HTTPException(400, "Provide either image_url or image_file")
 
-    # Prepare source: either pass URL straight through or read/upload as base64
-    b64 = None
-    src_url = None
+    # Source: either pass the URL straight through or read upload as base64
+    b64: Optional[str] = None
+    src_url: Optional[str] = None
 
     if url:
         src_url = url
@@ -53,17 +54,18 @@ async def identify(
         if not content:
             raise HTTPException(400, "Empty file")
         import base64
+
         b64 = base64.b64encode(content).decode("utf-8")
 
     # 1) Vision extraction
     try:
         vision = await extract_from_image(image_url=src_url, image_b64=b64)
     except Exception as e:
-        # Surface a clean upstream error
         raise HTTPException(status_code=502, detail=f"Vision provider error: {e}")
 
-    v = vision.data
-    last_vision_raw = v  # keep raw for debug
+    # extract_from_image returns a dict
+    v: Dict[str, Any] = vision if isinstance(vision, dict) else {}
+    last_vision_raw = v
 
     # Pull structured values (be defensive)
     artist = (v.get("artist") or "").strip() or None
@@ -96,7 +98,7 @@ async def identify(
                 )
             )
         except Exception:
-            # Skip any weird/partial items rather than exploding the whole response
+            # Skip partial/odd items; don’t explode the whole response
             continue
 
     best = c_models[0] if c_models else None
