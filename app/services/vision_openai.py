@@ -36,46 +36,47 @@ class VisionResult(BaseModel):
 async def extract_from_image(image_url: Optional[str] = None, image_b64: Optional[str] = None) -> VisionResult:
     """
     Uses OpenAI Vision to extract structured metadata from a record label image.
-    You can pass a public image_url OR a base64 encoded image (JPEG).
+    You can pass a public image_url or a base64 encoded image (JPEG).
     """
     if not image_url and not image_b64:
         raise ValueError("Must supply image_url or image_b64")
 
+    # Build the image part for chat completions
     if image_b64:
+        data_uri = f"data:image/jpeg;base64,{image_b64}"
         img_part = {
-            "type": "input_image",
-            "image": {"data": image_b64, "mime_type": "image/jpeg"}
+            "type": "image_url",
+            "image_url": {"url": data_uri}
         }
     else:
         img_part = {
-            "type": "input_image",
-            "image_url": image_url
+            "type": "image_url",
+            "image_url": {"url": image_url}
         }
 
-    # Send a multimodal request
-    resp = client.responses.create(
+    messages = [
+        {"role": "system", "content": VISION_SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Extract metadata as per schema."},
+            img_part
+        ]}
+    ]
+
+    # Call Chat Completions API to get JSON result
+    resp = client.chat.completions.create(
         model=MODEL,
-        input=[{
-            "role": "system",
-            "content": VISION_SYSTEM_PROMPT
-        },{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Extract metadata as per schema."},
-                img_part
-            ]
-        }],
+        messages=messages,
+        response_format={"type": "json_object"},
         temperature=0.0,
-        max_output_tokens=600
+        max_tokens=600
     )
 
-    # unified text accessor in v1 SDK
-    text = resp.output_text
+    # Extract the JSON text
+    text = resp.choices[0].message.content
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # fallback: strip fences
         cleaned = text.strip().removeprefix("```json").removesuffix("```").strip()
         data = json.loads(cleaned)
 
