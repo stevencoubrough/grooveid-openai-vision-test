@@ -159,9 +159,10 @@ def build_queries_from_vision(v: Dict[str, Any]) -> List[str]:
     artist: Optional[str] = None
     title: Optional[str] = None
     for l in lines:
+        # Candidate artist: uppercase or hyphenated line, avoid common generic words
         if 2 <= len(l) <= 30 and re.fullmatch(r"[A-Z0-9][A-Z0-9\-\s&/]{2,}", l):
             ll = l.lower()
-            if not any(x in ll for x in ("stereo", "mono", "records", "side", "made in", "rpm", "produced")):
+            if not any(x in ll for x in ("stereo", "mono", "records", "side", "made in", "rpm", "produced", "volume")):
                 artist = re.sub(r"\s+", " ", l).strip()
                 break
     for l in lines:
@@ -174,6 +175,23 @@ def build_queries_from_vision(v: Dict[str, Any]) -> List[str]:
             if 1 < len(ws) <= 5 and l == l.lower():
                 title = l.strip()
                 break
+
+    # Extract potential track titles from lines. Remove common prefixes like A1/B1/2.
+    track_names: List[str] = []
+    for l in lines:
+        # Remove side and track numbering prefixes (e.g. "A1.", "B1:", "2.")
+        cleaned = re.sub(r'^[AB]?\d+\.?\s*', '', l).strip()
+        # Skip if cleaned line is empty or clearly generic
+        if not cleaned:
+            continue
+        clow = cleaned.lower()
+        # Exclude words indicating sides, volumes, usage notes
+        if any(x in clow for x in ("side", "volume", "vol", "promo", "use only", "rpm")):
+            continue
+        # Keep lines that are likely track titles (1-5 words)
+        if 1 <= len(cleaned.split()) <= 6:
+            track_names.append(cleaned)
+
 
     if artist and title:
         queries.append(f'site:discogs.com "{artist}" "{title}"')
@@ -192,6 +210,19 @@ def build_queries_from_vision(v: Dict[str, Any]) -> List[str]:
             queries.append(s)
         else:
             queries.append(f'site:discogs.com "{s}"')
+
+    # Combine multiple track names into queries. This helps surface releases where multiple track titles
+    # appear together, which can avoid false positives on widely known songs. Use adjacent pairs.
+    if len(track_names) >= 2:
+        for i in range(len(track_names) - 1):
+            t1, t2 = track_names[i], track_names[i + 1]
+            # Only add if both titles are reasonably short
+            if 1 <= len(t1.split()) <= 5 and 1 <= len(t2.split()) <= 5:
+                queries.append(f'site:discogs.com "{t1}" "{t2}"')
+    # Also add a single query with all track names joined (within first four to avoid huge queries)
+    if track_names:
+        joined = " ".join(f'"{t}"' for t in track_names[:4])
+        queries.append(f'site:discogs.com {joined}')
     if raw_text:
         queries.append(f'site:discogs.com "{raw_text[:120]}"')
     if not queries and vis:
@@ -389,6 +420,7 @@ async def identify(
             data = await google_search(q, num=10)
             items = data.get("items", [])
             discogs_candidates += keep_discogs_release_links(items)
+            # Continue gathering candidates from all queries instead of breaking after the first hit.
             if len(discogs_candidates) >= max_candidates:
                 break
         # Fallback when nothing found: try raw text and guesses, else generic
