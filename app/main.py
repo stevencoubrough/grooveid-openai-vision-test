@@ -1,82 +1,84 @@
+"""
+FastAPI application for identifying records from images.
+
+This module exposes a single POST /identify endpoint that accepts an image
+upload (JPG/PNG/WEBP) and returns the most likely Discogs release URL,
+alternates, confidence, and information extracted from the label. It uses
+OpenAI's GPT‑4o vision model to extract text and visual cues from the
+uploaded image, builds Discogs‑focused search queries, and queries the
+Google Programmable Search API to find matching releases. A simple
+heuristic then ranks results based on visual similarity to the uploaded
+thumbnail. Environment variables are used to configure API keys.
+
+If ``app/vision_openai.py`` is present, its ``extract_from_image``
+function will be used to extract structured metadata (artist, title,
+catalogNo, etc.). Otherwise a fallback stub will be used.
+"""
+
 import os
 import re
 import base64
 import logging
 import traceback
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-# Attempt to import the metadata extractor from vision_openai. In some
-# deployment setups (e.g. when running under `app.main` on Render),
-# ``vision_openai.py`` may not be available on the Python path. To avoid
-# import errors crashing the service, wrap this in a try/except and fall
-# back to a no-op extractor if the module is absent.
-try:
-    from vision_openai import extract_from_image  # metadata helper
-except ImportError:
-    async def extract_from_image(*args, **kwargs) -> Dict[str, Any]:
-        """Fallback metadata extractor that returns an empty result.
 
-        When ``vision_openai.py`` is not present in the runtime, this stub
-        will be used to satisfy calls in the identify pipeline. It simply
-        returns an empty dict, so no metadata-based queries are added.
-        """
-        return {}
-
-# --- OpenAI (>=1.0 SDK) ---
 from openai import OpenAI
 
-# ------------------------------------------------------------------------------
-# Environment
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+# Environment variables for API keys and search engine ID
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")  # Programmable Search Engine ID (cx)
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
+# Instantiate OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ------------------------------------------------------------------------------
-# FastAPI setup
-# ------------------------------------------------------------------------------
-app = FastAPI(title="GrooveID – Vision→Discogs Resolver")
+# -----------------------------------------------------------------------------
+# Metadata extraction helper
+# -----------------------------------------------------------------------------
+# Try to import extract_from_image from vision_openai. If the module isn't
+# present, define a fallback stub that returns an empty dict.
+try:
+    from .vision_openai import extract_from_image  # type: ignore
+except Exception:
+    async def extract_from_image(*args, **kwargs) -> Dict[str, Any]:
+        return {}
+
+# -----------------------------------------------------------------------------
+# FastAPI app and middleware
+# -----------------------------------------------------------------------------
+app = FastAPI(title="GrooveID – Vision→Discogs Resolver (app/main.py)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],  # consider restricting in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
-logger = logging.getLogger("grooveid")
+# Configure logging
+logger = logging.getLogger("grooveid_app")
 logging.basicConfig(level=logging.INFO)
 
-# ------------------------------------------------------------------------------
-# Global exception handler
-# ------------------------------------------------------------------------------
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request, exc):
-    logger.error("[unhandled] %s\n%s", exc, traceback.format_exc())
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Server error: {type(exc).__name__}: {str(exc)}"},
-    )
-
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-def img_bytes_to_data_url(b: bytes) -> str:
-    return f"data:image/jpeg;base64,{base64.b64encode(b).decode()}"
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
+def img_bytes_to_data_url(image_bytes: bytes, mime: str = "image/jpeg") -> str:
+    """Return a data URI for the given image bytes."""
+    return f"data:{mime};base64," + base64.b64encode(image_bytes).decode()
 
 def keep_discogs_release_links(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    kept = []
+    """Filter search results to only Discogs release or master URLs and get thumbnails."""
+    kept: List[Dict[str, Any]] = []
     for it in items or []:
         link = it.get("link", "") or ""
         if "discogs.com" in link and ("/release/" in link or "/master/" in link):
@@ -86,8 +88,8 @@ def keep_discogs_release_links(items: List[Dict[str, Any]]) -> List[Dict[str, An
             if imgs and isinstance(imgs, list):
                 thumb = imgs[0].get("src")
             kept.append({"url": link, "title": it.get("title", ""), "thumb": thumb})
-    # de-dupe
-    seen, uniq = set(), []
+    seen: set[str] = set()
+    uniq: List[Dict[str, Any]] = []
     for c in kept:
         if c["url"] not in seen:
             uniq.append(c)
@@ -95,6 +97,7 @@ def keep_discogs_release_links(items: List[Dict[str, Any]]) -> List[Dict[str, An
     return uniq
 
 async def google_search(query: str, num: int = 10) -> Dict[str, Any]:
+    """Perform a Google Programmable Search and return the JSON response."""
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
         raise HTTPException(500, "Google CSE not configured")
     url = "https://www.googleapis.com/customsearch/v1"
@@ -113,48 +116,34 @@ async def google_search(query: str, num: int = 10) -> Dict[str, Any]:
 
 def build_queries_from_vision(v: Dict[str, Any]) -> List[str]:
     """
-    Given the raw output from ``vision_extract``, construct a list of
-    Discogs-focused search queries. This function uses heuristics to
-    recognise artist names, titles, catalog numbers, phone numbers and
-    other identifiers in the extracted text, and wraps them in
-    ``site:discogs.com"..."`` queries. It also incorporates any search
-    terms suggested by the model and falls back to the visual
-    description when no text is available.
+    Build Discogs-targeted search queries from the output of vision_extract.
 
-    The goal is to prioritise precise identifiers (artist/title pairs,
-    catalog numbers, phone numbers) before falling back to more general
-    guesses or visual descriptions. Duplicate queries are removed while
-    preserving order.
+    Heuristics extract artist names, titles, catalog numbers and phone numbers
+    from the raw text. The returned list is ordered from most specific to
+    least specific. Duplicate queries are removed.
     """
     queries: List[str] = []
-
     raw_text = (v.get("raw_text") or "").strip()
     guesses = [g.strip() for g in (v.get("guesses") or []) if isinstance(g, str) and g.strip()]
     seeds = [q.strip() for q in (v.get("queries") or []) if isinstance(q, str) and q.strip()]
     vis = (v.get("visual_description") or "").strip()
 
-    # Parse raw text into lines and join for regex searches
     lines: List[str] = [l.strip() for l in raw_text.splitlines() if l.strip()]
     text_joined = " ".join(lines)
 
-    # Regex patterns for phone numbers and catalog numbers
     phone_re = re.compile(r'(?:\+?\d[\d\-\s]{6,}\d)')
     catalog_re = re.compile(r'\b([A-Z]{1,6}\s?-?\s?\d{2,6}[A-Z]?)\b')
-
     phones = phone_re.findall(text_joined)
     catalogs = [m.group(1).replace(" ", "") for m in catalog_re.finditer(text_joined)][:3]
 
-    # Heuristic extraction of artist and title
     artist: Optional[str] = None
     title: Optional[str] = None
     for l in lines:
-        # Candidate artist: uppercase or hyphenated, not generic words
         if 2 <= len(l) <= 30 and re.fullmatch(r"[A-Z0-9][A-Z0-9\-\s&/]{2,}", l):
             ll = l.lower()
             if not any(x in ll for x in ("stereo", "mono", "records", "side", "made in", "rpm", "produced")):
                 artist = re.sub(r"\s+", " ", l).strip()
                 break
-    # Candidate title: lines containing EP/LP/mix/remix or lowercase lines
     for l in lines:
         if re.search(r'\b(ep|lp|mix|remix|remixes|vol\.?|volume)\b', l, re.IGNORECASE):
             title = re.sub(r"\s+", " ", l).strip()
@@ -166,35 +155,28 @@ def build_queries_from_vision(v: Dict[str, Any]) -> List[str]:
                 title = l.strip()
                 break
 
-    # Build queries starting with strongest identifiers
     if artist and title:
         queries.append(f'site:discogs.com "{artist}" "{title}"')
         queries.append(f'site:discogs.com "{title}" "{artist}"')
-    # Catalog numbers and phone numbers
     for c in catalogs:
         queries.append(f'site:discogs.com "{c}"')
     for p in phones[:2]:
         queries.append(f'site:discogs.com "{p}"')
-    # Guesses from the model
     for g in guesses[:6]:
         if g.lower().startswith("site:discogs.com"):
             queries.append(g)
         else:
             queries.append(f'site:discogs.com "{g}"')
-    # Seeds (model-suggested search queries)
     for s in seeds[:6]:
         if s.lower().startswith("site:discogs.com"):
             queries.append(s)
         else:
             queries.append(f'site:discogs.com "{s}"')
-    # Raw text fallback (truncated to avoid huge queries)
     if raw_text:
         queries.append(f'site:discogs.com "{raw_text[:120]}"')
-    # Final fallback: use visual description if nothing else
     if not queries and vis:
         queries.append(f'site:discogs.com "{vis}"')
 
-    # Deduplicate while preserving order
     seen: set[str] = set()
     uniq: List[str] = []
     for q in queries:
@@ -206,24 +188,14 @@ def build_queries_from_vision(v: Dict[str, Any]) -> List[str]:
 
 async def vision_extract(image_bytes: bytes) -> Dict[str, Any]:
     """
-    Use OpenAI Vision (gpt-4o) in OCR mode to extract as much text as possible
-    from the record label and build a set of initial search queries. This
-    function instructs the model to behave as an OCR engine and record
-    metadata extractor, rather than a generic description model. It returns
-    a dict with keys: ``raw_text`` (newline-separated text extracted from
-    the label), ``visual_description`` (a short caption describing the
-    label's appearance), ``queries`` (a list of search query strings
-    derived by the model), and ``guesses`` (tokens like artist, title,
-    catalog numbers, phone numbers, etc. that can be used to build
-    additional queries).
+    Use OpenAI Vision (gpt‑4o) in OCR mode to extract text and build search queries.
 
-    The prompt is tailored to emphasise exact text extraction and Discogs
-    search preparation. A low temperature and JSON response format ensure
-    deterministic output. If the call fails, the function returns empty
-    fields so the pipeline can fall back on other strategies.
+    The prompt instructs the model to act as an OCR engine, extracting
+    printed text and inferring likely metadata (artist, title, catalog numbers,
+    etc.). It returns a JSON object with ``raw_text``, ``visual_description``,
+    ``queries`` and ``guesses``. If the call fails, empty fields are returned.
     """
     data_url = img_bytes_to_data_url(image_bytes)
-    # System prompt: emphasise OCR and metadata extraction for Discogs
     system = (
         "You are an OCR engine and record-label reader. Extract ALL visible text "
         "exactly as printed (letters, numbers, hyphens, symbols) from the record label "
@@ -250,7 +222,6 @@ async def vision_extract(image_bytes: bytes) -> Dict[str, Any]:
         )
         import json
         parsed = json.loads(resp.choices[0].message.content or "{}")
-        # normalise keys
         parsed.setdefault("raw_text", "")
         parsed.setdefault("visual_description", "")
         parsed.setdefault("queries", [])
@@ -261,14 +232,16 @@ async def vision_extract(image_bytes: bytes) -> Dict[str, Any]:
         return {"raw_text": "", "visual_description": "", "queries": [], "guesses": []}
 
 async def score_similarity_with_vision(query_img_bytes: bytes, candidate_thumb_url: str) -> Optional[float]:
+    """
+    Ask OpenAI Vision to score visual similarity between the uploaded image
+    and a candidate thumbnail. Returns a float in [0,1] or None on error.
+    """
     if not candidate_thumb_url:
         return None
     try:
         data_url = img_bytes_to_data_url(query_img_bytes)
         messages = [
-            {"role": "system", "content":
-                "Score visual similarity between two images of a record (0.0 to 1.0). "
-                "Return ONLY a number."},
+            {"role": "system", "content": "Score visual similarity between two images of a record (0.0 to 1.0). Return ONLY a number."},
             {"role": "user", "content": [
                 {"type": "input_text", "text": "Compare these two images and return a single number 0.0–1.0."},
                 {"type": "input_image", "image_url": data_url},
@@ -289,9 +262,9 @@ async def score_similarity_with_vision(query_img_bytes: bytes, candidate_thumb_u
         logger.warning("[similarity] FAILED for %s: %s", candidate_thumb_url, e)
     return None
 
-# ------------------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Pydantic model for responses
+# -----------------------------------------------------------------------------
 class IdentifyResponse(BaseModel):
     discogs_url: Optional[str] = None
     confidence: Optional[float] = None
@@ -300,11 +273,12 @@ class IdentifyResponse(BaseModel):
     vision_text: Optional[str] = None
     vision_description: Optional[str] = None
 
-# ------------------------------------------------------------------------------
-# Endpoints
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
 @app.get("/health")
-def health():
+def health() -> Dict[str, Any]:
+    """Simple health check endpoint."""
     return {
         "ok": True,
         "has_openai_key": bool(OPENAI_API_KEY),
@@ -317,28 +291,27 @@ async def identify(
     file: UploadFile = File(...),
     max_candidates: int = Query(8, ge=1, le=20),
     do_visual_check: bool = Query(True),
-):
+) -> IdentifyResponse:
+    """
+    Identify a record from an uploaded image.
+
+    The endpoint uses OpenAI Vision to extract text and build search queries,
+    queries Google CSE to find Discogs releases, and optionally re-ranks
+    candidates based on visual similarity. If metadata extraction helper is
+    available, additional targeted queries based on artist, title, catalogNo and
+    keywords are prepended.
+    """
     if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(400, "Please upload a JPG/PNG/WEBP image.")
-
     image_bytes = await file.read()
     logger.info("[identify] file=%s (%s bytes)", file.filename, len(image_bytes))
 
+    # Step 1: Vision extract
     v = await vision_extract(image_bytes)
     queries = build_queries_from_vision(v)
     used_queries: List[str] = []
-    logger.info("[identify] initial queries=%s", queries)
 
-    # ----------------------------------------------------------------------
-    # Metadata-based queries via vision_openai
-    # ----------------------------------------------------------------------
-    # In addition to the raw text and guesses returned by vision_extract(),
-    # use the strict metadata extractor to pull artist, title, catalog
-    # numbers, and free keywords from the label. If present, these values
-    # are used to build Discogs-targeted search queries that often yield
-    # direct hits even when OCR on the image sticker fails (e.g., small
-    # stickers or white-label pressings). These metadata queries are
-    # prepended to the query list so they are tried first.
+    # Step 2: Metadata-based queries (if helper returns data)
     try:
         meta = await extract_from_image(image_b64=base64.b64encode(image_bytes).decode())
     except Exception:
@@ -346,33 +319,28 @@ async def identify(
     meta_queries: List[str] = []
     artist = meta.get("artist") if isinstance(meta.get("artist"), str) else None
     title = meta.get("title") if isinstance(meta.get("title"), str) else None
+    catalog = meta.get("catalogNo") if isinstance(meta.get("catalogNo"), str) else None
     if artist and title:
         meta_queries.append(f'site:discogs.com "{artist}" "{title}"')
-    catalog = meta.get("catalogNo") if isinstance(meta.get("catalogNo"), str) else None
     if catalog:
         meta_queries.append(f'site:discogs.com "{catalog}"')
     for kw in (meta.get("keywords") or [])[:3]:
         if isinstance(kw, str) and kw.strip():
             meta_queries.append(f'site:discogs.com "{kw.strip()}"')
-
-    # Prepend metadata-based queries so they are attempted before OCR-derived
-    # and guess-based queries
+    # Prepend metadata queries
     queries = meta_queries + queries
 
+    # Step 3: Search Discogs via Google
+    discogs_candidates: List[Dict[str, Any]] = []
     try:
-        discogs_candidates: List[Dict[str, Any]] = []
-
         for q in queries:
             used_queries.append(q)
             data = await google_search(q, num=10)
             items = data.get("items", [])
-            logger.info("[results] %d items for: %s", len(items), q)
-            for i, it in enumerate(items[:5], 1):
-                logger.info("  %d) %s — %s", i, it.get("title"), it.get("link"))
             discogs_candidates += keep_discogs_release_links(items)
             if len(discogs_candidates) >= max_candidates:
                 break
-
+        # Fallback when nothing found
         if not discogs_candidates:
             fallback_texts: List[str] = []
             if v.get("raw_text"):
@@ -380,20 +348,15 @@ async def identify(
             fallback_texts.extend(v.get("guesses", []) or [])
             fb = [t.strip() for t in fallback_texts if isinstance(t, str) and t.strip()]
             fb = fb[:3] or ["vinyl record minimal label"]
-
             for t in fb:
                 q = f'site:discogs.com "{t}"'
                 used_queries.append(q)
                 data = await google_search(q, num=10)
                 items = data.get("items", [])
-                logger.info("[fallback] %d items for: %s", len(items), q)
                 discogs_candidates += keep_discogs_release_links(items)
                 if len(discogs_candidates) >= max_candidates:
                     break
-
         discogs_candidates = discogs_candidates[:max_candidates]
-        logger.info("[identify] discogs candidates=%d", len(discogs_candidates))
-
     except HTTPException as he:
         logger.error("[identify] controlled error: %s", getattr(he, "detail", he))
         raise he
@@ -414,9 +377,8 @@ async def identify(
     best_url = discogs_candidates[0]["url"]
     best_score = 0.86
     ranked = discogs_candidates
-
     if do_visual_check:
-        scored: List[tuple[Dict[str, Any], float]] = []
+        scored: List[Tuple[Dict[str, Any], float]] = []
         for c in discogs_candidates:
             score = await score_similarity_with_vision(image_bytes, c.get("thumb"))
             scored.append((c, score if score is not None else 0.5))
@@ -424,12 +386,10 @@ async def identify(
         ranked = [c for c, _ in scored]
         best_url, best_score = ranked[0]["url"], scored[0][1]
         logger.info("[identify] best by visual=%.3f %s", best_score, best_url)
-
     alternates = [
         {"url": c["url"], "title": c.get("title", ""), "thumb": c.get("thumb")}
         for c in ranked[1:3]
     ]
-
     return IdentifyResponse(
         discogs_url=best_url,
         confidence=float(best_score),
