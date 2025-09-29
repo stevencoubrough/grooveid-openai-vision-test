@@ -42,6 +42,24 @@ GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -----------------------------------------------------------------------------
+# Debug helpers
+#
+# We capture the most recent error messages from the various stages of the
+# pipeline so they can be surfaced when debug mode is enabled. The keys of
+# this dictionary correspond to the stage (vision, google, metadata, search).
+_last_errors: Dict[str, Optional[str]] = {
+    "vision": None,
+    "google": None,
+    "metadata": None,
+    "search": None,
+}
+
+def _reset_errors() -> None:
+    """Reset the last error messages."""
+    for k in _last_errors:
+        _last_errors[k] = None
+
+# -----------------------------------------------------------------------------
 # Metadata extraction helper
 # -----------------------------------------------------------------------------
 # Try to import extract_from_image from vision_openai. If the module isn't
@@ -111,6 +129,8 @@ async def google_search(query: str, num: int = 10) -> Dict[str, Any]:
         r.raise_for_status()
         return r.json()
     except Exception as e:
+        # Record the error for debug purposes
+        _last_errors["google"] = f"{e}" if not hasattr(e, "detail") else str(e.detail)
         logger.error("[google] FAILED: %s\n%s", e, traceback.format_exc())
         raise HTTPException(502, f"Google search error for '{query}'")
 
@@ -228,6 +248,8 @@ async def vision_extract(image_bytes: bytes) -> Dict[str, Any]:
         parsed.setdefault("guesses", [])
         return parsed
     except Exception as e:
+        # Record the error so it can be returned in debug mode
+        _last_errors["vision"] = str(e)
         logger.error("[vision] FAILED: %s\n%s", e, traceback.format_exc())
         return {"raw_text": "", "visual_description": "", "queries": [], "guesses": []}
 
@@ -291,48 +313,65 @@ async def identify(
     file: UploadFile = File(...),
     max_candidates: int = Query(8, ge=1, le=20),
     do_visual_check: bool = Query(True),
-) -> IdentifyResponse:
+    debug: bool = Query(False),
+) -> IdentifyResponse | JSONResponse:
     """
     Identify a record from an uploaded image.
 
-    The endpoint uses OpenAI Vision to extract text and build search queries,
-    queries Google CSE to find Discogs releases, and optionally re-ranks
-    candidates based on visual similarity. If metadata extraction helper is
+    This endpoint uses OpenAI Vision to extract text and build search queries,
+    queries Google CSE to find Discogs releases, and optionally re‑ranks
+    candidates based on visual similarity. If a metadata extraction helper is
     available, additional targeted queries based on artist, title, catalogNo and
     keywords are prepended.
     """
+    # Validate content type
     if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(400, "Please upload a JPG/PNG/WEBP image.")
+
+    # Reset error tracking
+    _reset_errors()
+
+    # Read the uploaded image
     image_bytes = await file.read()
     logger.info("[identify] file=%s (%s bytes)", file.filename, len(image_bytes))
 
+    # -------------------------------------------------------------------------
     # Step 1: Vision extract
+    # -------------------------------------------------------------------------
     v = await vision_extract(image_bytes)
     queries = build_queries_from_vision(v)
     used_queries: List[str] = []
 
+    # -------------------------------------------------------------------------
     # Step 2: Metadata-based queries (if helper returns data)
+    # -------------------------------------------------------------------------
     try:
         meta = await extract_from_image(image_b64=base64.b64encode(image_bytes).decode())
-    except Exception:
+    except Exception as e:
+        # Capture metadata extraction errors for debug
+        _last_errors["metadata"] = str(e)
         meta = {}
     meta_queries: List[str] = []
-    artist = meta.get("artist") if isinstance(meta.get("artist"), str) else None
-    title = meta.get("title") if isinstance(meta.get("title"), str) else None
-    catalog = meta.get("catalogNo") if isinstance(meta.get("catalogNo"), str) else None
-    if artist and title:
-        meta_queries.append(f'site:discogs.com "{artist}" "{title}"')
-    if catalog:
-        meta_queries.append(f'site:discogs.com "{catalog}"')
-    for kw in (meta.get("keywords") or [])[:3]:
-        if isinstance(kw, str) and kw.strip():
-            meta_queries.append(f'site:discogs.com "{kw.strip()}"')
+    if isinstance(meta, dict):
+        artist = meta.get("artist") if isinstance(meta.get("artist"), str) else None
+        title = meta.get("title") if isinstance(meta.get("title"), str) else None
+        catalog = meta.get("catalogNo") if isinstance(meta.get("catalogNo"), str) else None
+        if artist and title:
+            meta_queries.append(f'site:discogs.com "{artist}" "{title}"')
+        if catalog:
+            meta_queries.append(f'site:discogs.com "{catalog}"')
+        for kw in (meta.get("keywords") or [])[:3]:
+            if isinstance(kw, str) and kw.strip():
+                meta_queries.append(f'site:discogs.com "{kw.strip()}"')
     # Prepend metadata queries
     queries = meta_queries + queries
 
+    # -------------------------------------------------------------------------
     # Step 3: Search Discogs via Google
+    # -------------------------------------------------------------------------
     discogs_candidates: List[Dict[str, Any]] = []
     try:
+        # Execute each query until we gather enough candidates
         for q in queries:
             used_queries.append(q)
             data = await google_search(q, num=10)
@@ -340,18 +379,18 @@ async def identify(
             discogs_candidates += keep_discogs_release_links(items)
             if len(discogs_candidates) >= max_candidates:
                 break
-        # Fallback when nothing found
+        # Fallback when nothing found: try raw text and guesses, else generic
         if not discogs_candidates:
             fallback_texts: List[str] = []
             if v.get("raw_text"):
                 fallback_texts.append(v["raw_text"])
             fallback_texts.extend(v.get("guesses", []) or [])
-            fb = [t.strip() for t in fallback_texts if isinstance(t, str) and t.strip()]
-            fb = fb[:3] or ["vinyl record minimal label"]
-            for t in fb:
-                q = f'site:discogs.com "{t}"'
-                used_queries.append(q)
-                data = await google_search(q, num=10)
+            fb_terms = [t.strip() for t in fallback_texts if isinstance(t, str) and t.strip()]
+            fb_terms = fb_terms[:3] or ["vinyl record minimal label"]
+            for t in fb_terms:
+                fq = f'site:discogs.com "{t}"'
+                used_queries.append(fq)
+                data = await google_search(fq, num=10)
                 items = data.get("items", [])
                 discogs_candidates += keep_discogs_release_links(items)
                 if len(discogs_candidates) >= max_candidates:
@@ -359,24 +398,42 @@ async def identify(
         discogs_candidates = discogs_candidates[:max_candidates]
     except HTTPException as he:
         logger.error("[identify] controlled error: %s", getattr(he, "detail", he))
+        # Bubble HTTP exceptions directly
         raise he
     except Exception as e:
+        # Capture search errors for debug
+        _last_errors["search"] = str(e)
         logger.error("[identify] search loop FAILED: %s\n%s", e, traceback.format_exc())
         raise HTTPException(502, "Search pipeline failed")
 
+    # -------------------------------------------------------------------------
+    # Step 4: Build response
+    # -------------------------------------------------------------------------
     if not discogs_candidates:
-        return IdentifyResponse(
-            discogs_url=None,
-            confidence=None,
-            alternates=[],
-            used_queries=used_queries,
-            vision_text=v.get("raw_text", ""),
-            vision_description=v.get("visual_description", ""),
-        )
+        # No result found
+        result: Dict[str, Any] = {
+            "discogs_url": None,
+            "confidence": None,
+            "alternates": [],
+            "used_queries": used_queries,
+            "vision_text": v.get("raw_text", ""),
+            "vision_description": v.get("visual_description", ""),
+        }
+        if debug:
+            result["_debug"] = {
+                "errors": {k: err for k, err in _last_errors.items() if err},
+                "vision": v,
+                "meta": meta,
+            }
+            return JSONResponse(result)
+        return IdentifyResponse(**result)
 
+    # We have at least one candidate
     best_url = discogs_candidates[0]["url"]
-    best_score = 0.86
-    ranked = discogs_candidates
+    best_score: float = 0.86
+    ranked: List[Dict[str, Any]] = discogs_candidates
+
+    # Optionally re-rank based on visual similarity
     if do_visual_check:
         scored: List[Tuple[Dict[str, Any], float]] = []
         for c in discogs_candidates:
@@ -386,15 +443,27 @@ async def identify(
         ranked = [c for c, _ in scored]
         best_url, best_score = ranked[0]["url"], scored[0][1]
         logger.info("[identify] best by visual=%.3f %s", best_score, best_url)
-    alternates = [
+
+    # Alternates: up to two alternates with title and thumb
+    alternates: List[Dict[str, Any]] = [
         {"url": c["url"], "title": c.get("title", ""), "thumb": c.get("thumb")}
         for c in ranked[1:3]
     ]
-    return IdentifyResponse(
-        discogs_url=best_url,
-        confidence=float(best_score),
-        alternates=alternates,
-        used_queries=used_queries,
-        vision_text=v.get("raw_text", ""),
-        vision_description=v.get("visual_description", ""),
-    )
+
+    # Final response
+    result: Dict[str, Any] = {
+        "discogs_url": best_url,
+        "confidence": float(best_score),
+        "alternates": alternates,
+        "used_queries": used_queries,
+        "vision_text": v.get("raw_text", ""),
+        "vision_description": v.get("visual_description", ""),
+    }
+    if debug:
+        result["_debug"] = {
+            "errors": {k: err for k, err in _last_errors.items() if err},
+            "vision": v,
+            "meta": meta,
+        }
+        return JSONResponse(result)
+    return IdentifyResponse(**result)
