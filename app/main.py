@@ -10,13 +10,22 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-# Import metadata extractor from vision_openai. This helper extracts artist,
-# title, label, catalog numbers and keywords from the image and returns
-# structured JSON. We use it to build additional Discogs-focused search
-# queries when OCR alone is not sufficient.
-# Import metadata extractor. vision_openai.py is located in the project root
-# so we import directly from the module name.
-from vision_openai import extract_from_image  # metadata helper
+# Attempt to import the metadata extractor from vision_openai. In some
+# deployment setups (e.g. when running under `app.main` on Render),
+# ``vision_openai.py`` may not be available on the Python path. To avoid
+# import errors crashing the service, wrap this in a try/except and fall
+# back to a no-op extractor if the module is absent.
+try:
+    from vision_openai import extract_from_image  # metadata helper
+except ImportError:
+    async def extract_from_image(*args, **kwargs) -> Dict[str, Any]:
+        """Fallback metadata extractor that returns an empty result.
+
+        When ``vision_openai.py`` is not present in the runtime, this stub
+        will be used to satisfy calls in the identify pipeline. It simply
+        returns an empty dict, so no metadata-based queries are added.
+        """
+        return {}
 
 # --- OpenAI (>=1.0 SDK) ---
 from openai import OpenAI
