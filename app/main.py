@@ -227,10 +227,15 @@ async def vision_extract(image_bytes: bytes) -> Dict[str, Any]:
     )
     msg = [
         {"role": "system", "content": system},
-        {"role": "user", "content": [
-            {"type": "input_text", "text": "Extract text and build Discogs-ready queries."},
-            {"type": "input_image", "image_url": data_url},
-        ]},
+        {
+            "role": "user",
+            # For multimodal messages, use 'text' and 'image_url' instead of the deprecated
+            # 'input_text'/'input_image'. The image_url must be a dict with a 'url' field.
+            "content": [
+                {"type": "text", "text": "Extract text and build Discogs-ready queries."},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
     ]
     try:
         logger.info("[vision] calling OpenAI (OCR mode)")
@@ -263,12 +268,19 @@ async def score_similarity_with_vision(query_img_bytes: bytes, candidate_thumb_u
     try:
         data_url = img_bytes_to_data_url(query_img_bytes)
         messages = [
-            {"role": "system", "content": "Score visual similarity between two images of a record (0.0 to 1.0). Return ONLY a number."},
-            {"role": "user", "content": [
-                {"type": "input_text", "text": "Compare these two images and return a single number 0.0–1.0."},
-                {"type": "input_image", "image_url": data_url},
-                {"type": "input_image", "image_url": candidate_thumb_url},
-            ]},
+            {
+                "role": "system",
+                "content": "Score visual similarity between two images of a record (0.0 to 1.0). Return ONLY a number."
+            },
+            {
+                "role": "user",
+                # Use correct multimodal content types. Each image_url must be a dict with a 'url' key.
+                "content": [
+                    {"type": "text", "text": "Compare these two images and return a single number 0.0–1.0."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "image_url", "image_url": {"url": candidate_thumb_url}},
+                ],
+            },
         ]
         resp = client.chat.completions.create(
             model="gpt-4o",
